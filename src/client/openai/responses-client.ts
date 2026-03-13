@@ -664,10 +664,16 @@ export class OpenAIResponsesProvider implements ApiProvider {
           thinking: { type: 'disabled' },
         };
       } else {
+        const reasoning: NonNullable<ResponseCreateParamsBase['reasoning']> = {
+          effort: thinking.effort ?? 'medium',
+        };
+        if (thinking.summary !== undefined) {
+          reasoning.summary = thinking.summary;
+        }
         return {
           thinking: { type: thinking.type },
           // Defaults to 'medium' effort
-          reasoning: { effort: thinking.effort ?? 'medium' },
+          reasoning,
         };
       }
     } else {
@@ -676,9 +682,15 @@ export class OpenAIResponsesProvider implements ApiProvider {
           reasoning: { effort: 'none' },
         };
       } else {
+        const reasoning: NonNullable<ResponseCreateParamsBase['reasoning']> = {
+          effort: thinking.effort ?? 'medium',
+        };
+        if (thinking.summary !== undefined) {
+          reasoning.summary = thinking.summary;
+        }
         return {
           // Defaults to 'medium' effort
-          reasoning: { effort: thinking.effort ?? 'medium' },
+          reasoning,
         };
       }
     }
@@ -1511,9 +1523,18 @@ export class OpenAIResponsesProvider implements ApiProvider {
     performanceTrace.ttft =
       Date.now() - (performanceTrace.tts + performanceTrace.ttf);
 
-    yield* this.extractThinkingParts(
-      message.output.filter((v) => v.type === 'reasoning'),
+    const reasonings = message.output.filter(
+      (v): v is ResponseReasoningItem => v.type === 'reasoning',
     );
+
+    yield* this.extractThinkingParts(reasonings);
+
+    if (
+      this.hasEncryptedReasoning(reasonings) &&
+      !this.hasReasoningContentText(reasonings)
+    ) {
+      yield new vscode.LanguageModelThinkingPart('Encrypted thinking...');
+    }
 
     for (const item of message.output) {
       switch (item.type) {
@@ -1580,6 +1601,40 @@ export class OpenAIResponsesProvider implements ApiProvider {
     return parseToolArguments(argumentsJson);
   }
 
+  private hasReasoningContentText(
+    reasonings: readonly ResponseReasoningItem[],
+  ): boolean {
+    for (const reasoning of reasonings) {
+      for (const part of reasoning.content ?? []) {
+        if (part.type === 'reasoning_text' && part.text) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  private hasReasoningSummaryText(
+    reasonings: readonly ResponseReasoningItem[],
+  ): boolean {
+    for (const reasoning of reasonings) {
+      for (const part of reasoning.summary) {
+        if (part.type === 'summary_text' && part.text) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  private hasEncryptedReasoning(
+    reasonings: readonly ResponseReasoningItem[],
+  ): boolean {
+    return reasonings.some(
+      (reasoning) => typeof reasoning.encrypted_content === 'string',
+    );
+  }
+
   private *extractThinkingParts(
     reasonings: (ResponseReasoningItem | string)[],
     emitMode: 'full' | 'metadata-only' | 'content-only' = 'full',
@@ -1607,9 +1662,15 @@ export class OpenAIResponsesProvider implements ApiProvider {
         continue;
       }
 
-      for (const part of reasoning.summary) {
-        if (part.type === 'summary_text') {
-          yield* emitText(part.text);
+      const hasContentText = (reasoning.content ?? []).some(
+        (part) => part.type === 'reasoning_text' && !!part.text,
+      );
+
+      if (!hasContentText) {
+        for (const part of reasoning.summary) {
+          if (part.type === 'summary_text') {
+            yield* emitText(part.text);
+          }
         }
       }
 
@@ -1620,9 +1681,6 @@ export class OpenAIResponsesProvider implements ApiProvider {
       }
 
       if (reasoning.encrypted_content) {
-        if (emitMode !== 'metadata-only') {
-          yield new vscode.LanguageModelThinkingPart('Encrypted thinking...');
-        }
         if (metadata) {
           metadata.redactedData = reasoning.encrypted_content;
         }
@@ -1649,6 +1707,7 @@ export class OpenAIResponsesProvider implements ApiProvider {
     transportLabel: 'http' | 'sse' | 'websocket',
   ): AsyncGenerator<vscode.LanguageModelResponsePart2> {
     let usage: ResponseUsage | undefined;
+    let sawReasoningContentText = false;
 
     const recordFirstToken = createFirstTokenRecorder(performanceTrace);
 
@@ -1684,14 +1743,14 @@ export class OpenAIResponsesProvider implements ApiProvider {
 
         case 'response.reasoning_text.delta':
           if (event.delta) {
+            sawReasoningContentText = true;
             yield* this.extractThinkingParts([event.delta], 'content-only');
           }
           break;
 
         case 'response.reasoning_summary_text.delta':
-          if (event.delta) {
-            yield* this.extractThinkingParts([event.delta], 'content-only');
-          }
+          // Ignore streamed summary deltas. If the response contains no actual
+          // reasoning content, the final summary is emitted once on completion.
           break;
 
         case 'response.output_item.done': {
@@ -1710,8 +1769,28 @@ export class OpenAIResponsesProvider implements ApiProvider {
           const response = event.response;
           usage = response.usage ?? undefined;
 
+          const reasonings = response.output.filter(
+            (v): v is ResponseReasoningItem => v.type === 'reasoning',
+          );
+
+          if (
+            !sawReasoningContentText &&
+            this.hasReasoningSummaryText(reasonings)
+          ) {
+            yield* this.extractThinkingParts(reasonings, 'content-only');
+          }
+
+          if (
+            this.hasEncryptedReasoning(reasonings) &&
+            !sawReasoningContentText &&
+            !this.hasReasoningSummaryText(reasonings) &&
+            !this.hasReasoningContentText(reasonings)
+          ) {
+            yield new vscode.LanguageModelThinkingPart('Encrypted thinking...');
+          }
+
           yield* this.extractThinkingParts(
-            response.output.filter((v) => v.type === 'reasoning'),
+            reasonings,
             'metadata-only',
           );
 
