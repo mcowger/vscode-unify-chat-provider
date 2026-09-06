@@ -106,13 +106,13 @@ describe('GPT-6 Astra provider and request compatibility', () => {
       buildPresetTemplateConfigurationSchema(model)?.properties?.['reasoningEffort'],
     ).toMatchObject({
       enum: ['max', 'xhigh', 'high', 'medium', 'low'],
-      default: 'xhigh',
+      default: 'max',
     });
     expect(invokeBuilder(client, 'buildReasoningParams', [
       applyPresetTemplateSelections(model, undefined),
       false,
     ])).toEqual({
-      reasoning: { effort: 'xhigh', mode: 'standard', context: 'auto' },
+      reasoning: { effort: 'max', mode: 'standard', context: 'auto' },
     });
   });
 
